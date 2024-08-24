@@ -1,0 +1,4 @@
+telethon
+pymongo
+requests
+python-dotenv
