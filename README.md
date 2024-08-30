@@ -16,7 +16,7 @@ Discord webhook (optional, you can remove the code if you dont need it).
 
 ## installation
 
-you will need to grab the ripgrep binary from https://github.com/BurntSushi/ripgrep (shoutout), rename it to rg.deb and place it in the script directory on your own, as i've decided to not include any binaries in this repo.
+you will need to grab the ripgrep binary from https://github.com/BurntSushi/ripgrep (shoutout), rename it to rg and place it in the script directory on your own, as i've decided to not include any binaries in this repo.
 
 `sudo apt install unrar`
 
