@@ -4,7 +4,7 @@ Python tool for scraping infostealer logs dropped in telegram channels, with aut
 
 ## prerequisites
 
-Telegram account in [this channel](https://t.me/FreeLogsCloudForAll).
+Telegram account in the https://t.me/boxedpw channel listed as the 1st message.
 
 Telegram api id and hash - you can get one for free from https://my.telegram.org (i'd recommend an aged account though as they're picky about banning and not banning them), if you get an error when trying to make an app on the site, make sure ur not on a vpn, those are blacklisted.
 
