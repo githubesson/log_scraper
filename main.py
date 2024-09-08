@@ -11,16 +11,38 @@ import asyncio
 import errno
 from dotenv import load_dotenv
 import unicodedata
+import logging
 
 load_dotenv()
 
 api_id = os.getenv("TELEGRAM_API_ID")
 api_hash = os.getenv("TELEGRAM_API_HASH")
-channel_id = -1001713957406 # channel that aggregates all the logs - has to stay the same for the bot to work, as its set up for their specific format - its static though so you dont have to worry about that
+channel_id = -1001935880746 # channel that aggregates all the logs - has to stay the same for the bot to work, as its set up for their specific format - its static though so you dont have to worry about that
 MAX_CONCURRENT_DOWNLOADS = 1 # change this to however many files you want to download at once if multiple are dropped at the same time, above 3 is where telegram starts to get pissy about it
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 download_queue = asyncio.Queue()
 process_queue = asyncio.Queue()
+
+def setup_logger(log_file='app.log', log_level=logging.INFO):
+    logger = logging.getLogger(__name__)
+    logger.setLevel(log_level)
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(log_level)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+logger = setup_logger()
 
 async def download_worker():
     while True:
@@ -28,10 +50,10 @@ async def download_worker():
         try:
             async with download_semaphore:
                 file_path = await event.message.download_media(file=file_path)
-                print(f'New file downloaded to {file_path}')
+                logger.info(f'New file downloaded to {file_path}')
                 await process_queue.put((file_path, password))
         except Exception as e:
-            print(f"Error downloading file: {e}")
+            logger.error(f"Error downloading file: {e}")
         finally:
             download_queue.task_done()
 
@@ -45,9 +67,15 @@ async def process_worker():
             os.remove(file_path)
             shutil.rmtree(extract_path)
         except Exception as e:
-            print(f"Error processing file {file_path}: {e}")
+            logger.error(f"Error processing file {file_path}: {e}")
         finally:
             process_queue.task_done()
+
+def line_count(file_path):
+    with open(file_path, 'r') as file:
+        line_count = sum(1 for line in file if line.strip() and not line.lower().startswith('android://'))
+    return line_count
+
 
 client = TelegramClient('Session', api_id, api_hash)
 
@@ -71,7 +99,7 @@ def send_discord_webhook(webhook_url, message):
     }
     response = requests.post(webhook_url, json=data)
     if response.status_code != 204:
-        print(f"Failed to send Discord webhook. Status code: {response.status_code}")
+        logger.error(f"Failed to send Discord webhook. Status code: {response.status_code}")
 
 def parse_line(line):
     parts = line.strip().split(':')
@@ -101,7 +129,7 @@ def ingest_data(file_path, webhook_url):
     with open(file_path, 'r') as file:
         line_count = sum(1 for line in file if line.strip() and not line.lower().startswith('android://'))
     
-    print(f"Number of valid lines in {file_path}: {line_count}")
+    logger.info(f"Number of valid lines in {file_path}: {line_count}")
 
     inserted_count = 0
     with open(file_path, 'r') as file:
@@ -114,12 +142,12 @@ def ingest_data(file_path, webhook_url):
                         collection.insert_one(document)
                         inserted_count += 1
                     else:
-                        print(f"Skipping invalid line: {line}")
+                        logger.warning(f"Skipping invalid line: {line}")
                 except Exception as e:
-                    print(f"Error processing line: {line}. Error: {e}")
+                    logger.error(f"Error processing line: {line}. Error: {e}")
     
     completion_message = f"Data insertion completed. Inserted {inserted_count} documents out of {line_count} valid lines in {file_path}."
-    print(completion_message)
+    logger.info(completion_message)
 
     send_discord_webhook(webhook_url, completion_message)
 
@@ -133,9 +161,9 @@ def extract_file(file_path, extract_path, password=None):
         elif file_extension == '.rar':
             extract_rar_with_unrar(file_path, extract_path, password)
         else:
-            print(f"Unsupported file format: {file_extension}")
+            logger.error(f"Unsupported file format: {file_extension}")
             return
-        print(f"Successfully extracted {file_path} to {extract_path}")
+        logger.info(f"Successfully extracted {file_path} to {extract_path}")
         recursive_extract(extract_path, None)
         
         shutil.copy2('rg.deb', extract_path)
@@ -144,40 +172,36 @@ def extract_file(file_path, extract_path, password=None):
         os.chmod(rg_path, 0o755)
 
         try:
-            cmd1 = 'rg -oUNI "URL:\\s(.*?)[|\\r]\\nUsername:\\s(.*?)[|\\r]\\nPassword:\\s(.*?)[|\\r]\\n" -r \'$1:$2:$3\' --glob-case-insensitive -g "Passwords.txt" > combined.txt'
+            cmd1 = 'rg -oUNI "URL:\\s(.*?)[|\\r]\\nUsername:\\s(.*?)[|\\r]\\nPassword:\\s(.*?)[|\\r]\\n" -r \'$1:$2:$3\' --glob-case-insensitive -g "Passwords.txt" | uniq >> combined.txt'
             subprocess.run(cmd1, shell=True, cwd=extract_path, check=True)
-            print(f"Executed 1st rg command in {extract_path}")
+            logger.info(f"Executed 1st rg command in {extract_path}")
         except subprocess.CalledProcessError as e:
-            print(f"Error executing 1st rg command: {e}")
+            logger.error(f"Error executing 1st rg command: {e}")
             errors.append(f"1st rg command failed: {e}")
-
+        
         try:
-            cmd2 = 'rg -oUNI "URL:\\s*(.*?)\\nUSER:\\s*(.*?)\\nPASS:\\s*(.*?)\\n" -r "$1:$2:$3" --glob-case-insensitive -g "All Passwords.txt" > combined.txt'
+            cmd2 = 'rg -oUNI "URL:\s(.*)\nUSER:\s(.*)\nPASS:\s(.*)" -r \'$1:$2:$3\' --multiline --glob-case-insensitive -g "All Passwords.txt" | tr -d \'\r\' | uniq >> combined.txt'
             subprocess.run(cmd2, shell=True, cwd=extract_path, check=True)
-            print(f"Executed 2nd rg command in {extract_path}")
+            logger.info(f"Executed 2nd rg command in {extract_path}")
         except subprocess.CalledProcessError as e:
-            print(f"Error executing 2nd rg command: {e}")
+            logger.error(f"Error executing 2nd rg command: {e}")
             errors.append(f"2nd rg command failed: {e}")
+        
+        subprocess.run('uniq combined.txt', shell=True, cwd=extract_path, check=True, stdout=subprocess.DEVNULL)
 
-        try:
-            cmd3 = 'rg -oUNI "url:\\s*(.*?)\\nlogin:\\s*(.*?)\\npassword:\\s*(.*?)\\n" -r "$1:$2:$3" --glob-case-insensitive -g "passwords.txt" > combined.txt'
-            subprocess.run(cmd3, shell=True, cwd=extract_path, check=True)
-            print(f"Executed 3rd rg command in {extract_path}")
-        except subprocess.CalledProcessError as e:
-            print(f"Error executing 3rd rg command: {e}")
-            errors.append(f"3rd rg command failed: {e}")
-
-        if len(errors) < 3:
-            print(f"Proceeding with data ingestion despite {len(errors)} error(s).")
-            ingest_data(os.path.join(extract_path, 'combined.txt'), os.getenv('DISCORD_WEBHOOK_URL'))
+        if len(errors) < 2:
+            logger.info(f"Proceeding with data ingestion with {len(errors)} error(s).")
+            logger.info(f"Amount of lines: {line_count(os.path.join(extract_path, 'combined.txt'))}")
+            if line_count(os.path.join(extract_path, 'combined.txt')) > 0:
+                ingest_data(os.path.join(extract_path, 'combined.txt'), os.getenv("DISCORD_WEBHOOK"))
         else:
-            print("Too many errors, skipping data ingestion.")
-            print("\n".join(errors))
+            logger.error("Too many errors, skipping data ingestion.")
+            logger.error("\n".join(errors))
 
     except zipfile.BadZipFile:
-        print(f"Error: {file_path} is not a valid ZIP file.")
+        logger.error(f"Error: {file_path} is not a valid ZIP file.")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        logger.error(f"An unexpected error occurred: {e}")
 
 def extract_zip(file_path, extract_path, password=None):
     with zipfile.ZipFile(file_path, 'r') as zip_ref:
@@ -188,7 +212,7 @@ def extract_zip(file_path, extract_path, password=None):
                 zip_ref.extract(member, extract_path)
             except OSError as e:
                 if e.errno == errno.ENAMETOOLONG:
-                    print(f"Skipping file in archive due to path length: {member}")
+                    logger.warning(f"Skipping file in archive due to path length: {member}")
                 else:
                     raise
 
@@ -200,9 +224,9 @@ def extract_rar_with_unrar(file_path, extract_path, password=None):
             cmd.insert(2, f"-p{password}")
         
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(f"Successfully extracted {file_path} to {extract_path}")
+        logger.info(f"Successfully extracted {file_path} to {extract_path}")
     except subprocess.CalledProcessError as e:
-        print(f"Error extracting {file_path}: {e.stderr.decode()}")
+        logger.error(f"Error extracting {file_path}: {e.stderr.decode()}")
 
 def recursive_extract(path, password=None):
     for root, dirs, files in os.walk(path):
@@ -211,13 +235,13 @@ def recursive_extract(path, password=None):
                 file_path = os.path.join(root, file)
                 file_extension = os.path.splitext(file)[1].lower()
                 if file_extension in ['.zip', '.rar'] and os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
-                    print(f"Found large archive: {file_path}")
+                    logger.info(f"Found large archive: {file_path}")
                     new_extract_path = os.path.splitext(file_path)[0]
                     try:
                         os.makedirs(new_extract_path, exist_ok=True)
                     except OSError as e:
                         if e.errno == errno.ENAMETOOLONG:
-                            print(f"Skipping file due to path length: {file_path}")
+                            logger.warning(f"Skipping file due to path length: {file_path}")
                             continue
                         else:
                             raise
@@ -227,14 +251,14 @@ def recursive_extract(path, password=None):
                     elif file_extension == '.rar':
                         extract_rar_with_unrar(file_path, new_extract_path, password)
                     
-                    print(f"Successfully extracted {file_path} to {new_extract_path}")
+                    logger.info(f"Successfully extracted {file_path} to {new_extract_path}")
                     os.remove(file_path)
                     recursive_extract(new_extract_path, password)
             except OSError as e:
                 if e.errno == errno.ENAMETOOLONG:
-                    print(f"Skipping file due to path length: {os.path.join(root, file)}")
+                    logger.error(f"Skipping file due to path length: {os.path.join(root, file)}")
                 else:
-                    print(f"Unexpected error processing file {os.path.join(root, file)}: {e}")
+                    logger.error(f"Unexpected error processing file {os.path.join(root, file)}: {e}")
 
 async def handler(event):
     if event.message.media:
@@ -261,7 +285,6 @@ async def handler(event):
             valid_filename = valid_filename[:250] + f'{message_id}'
         
         message_text = event.message.message.strip() if event.message.message else ""
-        print(message_text)
 
         password_match = re.search(r'password:\s*(.*)', message_text, re.DOTALL)
         password = password_match.group(1).strip() if password_match else None
@@ -269,14 +292,14 @@ async def handler(event):
         if password == '?':
             password = None
         
-        print(f'Message link: {message_link}')
-        print(f'Filename: {valid_filename}')
-        print(f'File size: {file_size / (1024 * 1024):.2f} MB')
+        logger.info(f'Message link: {message_link}')
+        logger.info(f'Filename: {valid_filename}')
+        logger.info(f'File size: {file_size / (1024 * 1024):.2f} MB')
         
         if password:
-            print(f'Password: {password}')
+            logger.info(f'Password: {password}')
         else:
-            print('No password found or password is ignored.')
+            logger.info('No password found or password is ignored.')
         
         file_path = f'./{valid_filename}'
         await download_queue.put((event, file_path, password))
@@ -289,6 +312,8 @@ async def main():
     ] + [
         asyncio.create_task(process_worker()) for _ in range(MAX_CONCURRENT_DOWNLOADS)
     ]
+    
+    logger.info("Workers started, listening for messages...")
 
     @client.on(events.NewMessage(chats=channel_id))
     async def handler_wrapper(event):
