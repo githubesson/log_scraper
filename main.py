@@ -12,6 +12,7 @@ import errno
 from dotenv import load_dotenv
 import unicodedata
 import logging
+import pyzipper
 
 load_dotenv()
 
@@ -187,34 +188,46 @@ def extract_file(file_path, extract_path, password=None):
             logger.error(f"Error executing 2nd rg command: {e}")
             errors.append(f"2nd rg command failed: {e}")
         
-        subprocess.run('uniq combined.txt', shell=True, cwd=extract_path, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run('sort combined.txt | uniq -u > unique.txt', shell=True, cwd=extract_path, check=True, stdout=subprocess.DEVNULL)
 
         if len(errors) < 2:
             logger.info(f"Proceeding with data ingestion with {len(errors)} error(s).")
-            logger.info(f"Amount of lines: {line_count(os.path.join(extract_path, 'combined.txt'))}")
-            if line_count(os.path.join(extract_path, 'combined.txt')) > 0:
-                ingest_data(os.path.join(extract_path, 'combined.txt'), os.getenv("DISCORD_WEBHOOK"))
+            logger.info(f"Amount of lines before dedupe: {line_count(os.path.join(extract_path, 'combined.txt'))}")
+            logger.info(f"Amount of lines: {line_count(os.path.join(extract_path, 'unique.txt'))}")
+            if line_count(os.path.join(extract_path, 'unique.txt')) > 0:
+                ingest_data(os.path.join(extract_path, 'unique.txt'), os.getenv("DISCORD_WEBHOOK"))
         else:
             logger.error("Too many errors, skipping data ingestion.")
             logger.error("\n".join(errors))
 
-    except zipfile.BadZipFile:
-        logger.error(f"Error: {file_path} is not a valid ZIP file.")
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
 
 def extract_zip(file_path, extract_path, password=None):
-    with zipfile.ZipFile(file_path, 'r') as zip_ref:
-        if password:
-            zip_ref.setpassword(password.encode())
-        for member in zip_ref.namelist():
-            try:
-                zip_ref.extract(member, extract_path)
-            except OSError as e:
-                if e.errno == errno.ENAMETOOLONG:
-                    logger.warning(f"Skipping file in archive due to path length: {member}")
-                else:
-                    raise
+    try:
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            if password:
+                zip_ref.setpassword(password.encode())
+            _extract_all(zip_ref, extract_path)
+    except (RuntimeError, zipfile.BadZipFile, NotImplementedError):
+        try:
+            with pyzipper.AESZipFile(file_path, 'r') as zip_ref:
+                if password:
+                    zip_ref.pwd = password.encode()
+                _extract_all(zip_ref, extract_path)
+        except (RuntimeError, zipfile.BadZipFile, NotImplementedError) as e:
+            logger.error(f"Failed to extract zip file: {e}")
+            raise
+
+def _extract_all(zip_ref, extract_path):
+    for member in zip_ref.namelist():
+        try:
+            zip_ref.extract(member, extract_path)
+        except OSError as e:
+            if e.errno == errno.ENAMETOOLONG:
+                logger.warning(f"Skipping file in archive due to path length: {member}")
+            else:
+                raise
 
 def extract_rar_with_unrar(file_path, extract_path, password=None):
     try:
@@ -286,7 +299,7 @@ async def handler(event):
         
         message_text = event.message.message.strip() if event.message.message else ""
 
-        password_match = re.search(r'password:\s*(.*)', message_text, re.DOTALL)
+        password_match = re.search(r'.pass: (.*?)(?:\n|$)', message_text, re.DOTALL)
         password = password_match.group(1).strip() if password_match else None
 
         if password == '?':
